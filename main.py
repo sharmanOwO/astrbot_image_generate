@@ -289,7 +289,7 @@ class ImageGeneratePlugin(Star):
         form.add_field("n", "1")
         for image_bytes, filename, content_type in image_uploads:
             form.add_field(
-                "image[]",
+                "image",
                 image_bytes,
                 filename=filename,
                 content_type=content_type,
