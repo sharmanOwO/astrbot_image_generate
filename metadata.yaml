@@ -3,4 +3,4 @@ display_name: image_generate
 desc: 使用 gpt-image-2 实现文字生图和多参考图图生图。
 version: v1.3.1
 author: Sharman
-repo: ""
+repo: https://github.com/sharmanOwO/astrbot_image_generate

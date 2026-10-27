@@ -1,0 +1,45 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+config.json
+config.yaml
+config.yml
+*_config.json
+cookies*
+*cookie*.txt
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# Personal data, generated files and runtime state
+prompt.json
+presets.json
+cs/
+data/
+plugin_data/
+downloads/
+outputs/
+logs/
+*.log
+*.db
+*.sqlite*
+*.pdf
+*.zip
+*.tar*
+*.bak
+*.backup
+result.txt
+
+# Python and local development
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.test-artifacts/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

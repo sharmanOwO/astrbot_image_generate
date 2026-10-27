@@ -16,6 +16,12 @@
     "type": "string",
     "default": "https://api.apiqik.com/v1/images/edits"
   },
+  "model": {
+    "description": "生图模型名称",
+    "type": "string",
+    "hint": "文生图和图生图共用此模型，请填写接口支持的模型名称。留空使用默认模型。",
+    "default": "gpt-image-2-5-sunburst"
+  },
   "request_timeout": {
     "description": "生图请求超时时间（秒）",
     "type": "int",

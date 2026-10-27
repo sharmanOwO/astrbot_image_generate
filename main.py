@@ -1,10 +1,11 @@
 import asyncio
 import base64
 import binascii
+import re
 from typing import Any
 from math import gcd
 
-import aiohttp
+import requests
 import astrbot.api.message_components as Comp
 
 from astrbot.api import AstrBotConfig, logger
@@ -13,11 +14,16 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
 
-DEFAULT_API_URL = ""
-DEFAULT_EDIT_API_URL = ""
-MODEL = "gpt-image-2"
-IMAGE_SIZE = "1024x1536"
+DEFAULT_API_URL = "https://national.venlacy.com/v1/images/generations/"
+DEFAULT_EDIT_API_URL = "https://national.venlacy.com/v1/images/edits"
+DEFAULT_MODEL = "gpt-image-2-5-sunburst"
+IMAGE_SIZE = "1024x1024"
 ALLOWED_IMAGE_SIZES = frozenset({"1024x1024", "1024x1536", "1536x1024"})
+SIZE_ALIASES = {
+    "-s": "1024x1024", "方": "1024x1024", "方图": "1024x1024", "1024x1024": "1024x1024",
+    "-v": "1024x1536", "竖": "1024x1536", "竖图": "1024x1536", "1024x1536": "1024x1536",
+    "-h": "1536x1024", "横": "1536x1024", "横图": "1536x1024", "1536x1024": "1536x1024",
+}
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_TOTAL_INPUT_BYTES = 50 * 1024 * 1024
 
@@ -28,7 +34,7 @@ class ImageGenerationError(RuntimeError):
     """An expected error returned while generating or downloading an image."""
 
 
-@register("image_generate", "local", "使用 gpt-image-2 进行文字生图和图生图", "1.3.1")
+@register("image_generate", "local", "使用 gpt-image-2-5-sunburst 进行文字生图和图生图", "1.3.1")
 class ImageGeneratePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -37,30 +43,38 @@ class ImageGeneratePlugin(Star):
 
     @filter.llm_tool(name="generate_image")
     async def generate_image(
-        self, event: AstrMessageEvent, prompt: str
+        self, event: AstrMessageEvent, prompt: str, size: str = "1024x1024"
     ) -> MessageEventResult:
         """根据用户的文字描述生成图片；当用户要求生成、绘制或创作图片时调用。
 
         Args:
             prompt(string): 用于生成图片的完整、详细文字描述。
+            size(string): 输出图片尺寸，仅可选择 1024x1024（方图）、
+                1024x1536（竖图）或 1536x1024（横图）。根据用户要求的画幅
+                选择；未明确要求时根据画面内容判断，无法判断时使用 1024x1024。
+                无需向用户说明所选尺寸。
         """
         prompt = prompt.strip()
         if not prompt:
-            yield event.plain_result("生图失败：图片描述不能为空。")
+            yield event.plain_result("生图失败：图片描述不能为空喵")
             return
-
+        size = str(size).strip().lower().replace("×", "x")
+        if size not in ALLOWED_IMAGE_SIZES:
+            yield event.plain_result("生图失败：目前只有1024x1024（方图）、1024x1536（竖图）或 1536x1024（横图）三种尺寸喵"
+               )
+            return
         api_key = str(self.config.get("api_key", "")).strip()
         if not api_key:
-            yield event.plain_result("请先在插件配置中填写中转站 API Key。")
+            yield event.plain_result("还没有填写生图站 API Key喵~")
             return
 
         task = asyncio.create_task(
-            self._generate_and_send(event, prompt, api_key),
+            self._generate_and_send(event, prompt, api_key, size),
             name="image_generate_background_task",
         )
         self._generation_tasks.add(task)
         task.add_done_callback(self._generation_tasks.discard)
-        yield event.plain_result("已开始生成图片，完成后会自动发送。")
+        yield event.plain_result("已开始生成图片喵~")
 
     @filter.llm_tool(name="edit_image")
     async def edit_image_tool(
@@ -84,12 +98,12 @@ class ImageGeneratePlugin(Star):
         """
         prompt = prompt.strip()
         if not prompt:
-            yield event.plain_result("图生图失败：图片描述不能为空。")
+            yield event.plain_result("图生图失败：图片描述不能为空喵~")
             return
 
         api_key = str(self.config.get("api_key", "")).strip()
         if not api_key:
-            yield event.plain_result("请先在插件配置中填写中转站 API Key。")
+            yield event.plain_result("还没有填写 API Key喵~")
             return
 
         try:
@@ -100,7 +114,7 @@ class ImageGeneratePlugin(Star):
 
         if not image_uploads:
             yield event.plain_result(
-                "图生图失败：当前消息或引用消息中没有找到图片。"
+                "图生图失败：需要引用或包含图片喵~"
             )
             return
 
@@ -114,42 +128,110 @@ class ImageGeneratePlugin(Star):
             event, prompt, api_key, image_uploads, selected_size
         )
         yield event.plain_result(
-            f"已开始根据 {len(image_uploads)} 张参考图片生成图片，"
-            "完成后会自动发送。"
+            f"已开始根据 {len(image_uploads)} 张参考图生成图片喵，"
+            "完成后会自动发送喵~"
         )
 
-    @filter.command("tushengtu")
+    @filter.command("文生图", alias={"wst", "w"})
+    async def text_image(
+        self, event: AstrMessageEvent, prompt: GreedyStr
+    ) -> MessageEventResult:
+        """文生图 [尺寸选项] 描述；默认方图。"""
+        try:
+            prompt, size = self._parse_image_command(str(prompt), allow_reference=False)
+        except ImageGenerationError as exc:
+            yield event.plain_result(f"文生图失败：{exc}")
+            return
+        async for result in self.generate_image(event, prompt, size):
+            yield result
+
+    @staticmethod
+    def _parse_image_command(text: str, *, allow_reference: bool) -> tuple[str, str | int]:
+        """仅解析描述前的一个尺寸选项；整数表示从零开始的参考图索引。"""
+        parts = text.strip().split(maxsplit=1)
+        if not parts:
+            raise ImageGenerationError("图片描述不能为空；例如 /文生图 -v 一只猫")
+        token = parts[0].lower().replace("×", "x")
+        size: str | int = SIZE_ALIASES.get(token, IMAGE_SIZE)
+        reference = re.fullmatch(r"-\[([0-9]*)\]", token)
+        is_option = token in SIZE_ALIASES
+        if token == "-" or reference:
+            if not allow_reference:
+                raise ImageGenerationError("参考图尺寸选项仅支持图生图")
+            digits = reference.group(1) if reference else ""
+            if len(digits) > 9:
+                raise ImageGenerationError("参考图片索引过大")
+            size = int(digits or "0")
+            is_option = True
+        elif token.startswith("-") and not is_option:
+            raise ImageGenerationError("尺寸选项无效，请使用 -s、-v、-h，图生图还支持 -[i]")
+        prompt = parts[1].strip() if is_option and len(parts) == 2 else ("" if is_option else text.strip())
+        if not prompt:
+            raise ImageGenerationError("尺寸选项后需要填写图片描述")
+        return prompt, size
+
+    @filter.command("图生图", alias={"tst", "t", "tushengtu"})
     async def edit_image(
         self, event: AstrMessageEvent, prompt: GreedyStr
     ) -> MessageEventResult:
-        """使用当前消息或引用消息中的一张或多张图片进行图生图。"""
-
-        prompt = str(prompt).strip()
-        if not prompt:
-            yield event.plain_result("图生图失败：图片描述不能为空。")
-            return
-
-        api_key = str(self.config.get("api_key", "")).strip()
-        if not api_key:
-            yield event.plain_result("请先在插件配置中填写中转站 API Key。")
-            return
+        """使用消息或引用中的图片进行图生图；QQ 无图片时使用发送者头像。"""
 
         try:
-            image_uploads = await self._collect_input_images(event)
+            prompt, size = self._parse_image_command(str(prompt), allow_reference=True)
         except ImageGenerationError as exc:
             yield event.plain_result(f"图生图失败：{exc}")
             return
 
-        if not image_uploads:
-            yield event.plain_result(
-                "图生图失败：请在消息中附带图片，或引用一条包含图片的消息。"
-            )
+        api_key = str(self.config.get("api_key", "")).strip()
+        if not api_key:
+            yield event.plain_result("没有填写 API key 喵~")
             return
 
-        self._start_edit_task(event, prompt, api_key, image_uploads, IMAGE_SIZE)
+        used_avatar = False
+        try:
+            image_uploads = await self._collect_input_images(event)
+            if not image_uploads:
+                image_uploads = [await self._sender_avatar_upload(event)]
+                used_avatar = True
+            if isinstance(size, int):
+                if size >= len(image_uploads):
+                    raise ImageGenerationError(
+                        f"只有 {len(image_uploads)} 张参考图，索引范围为 0 至 {len(image_uploads) - 1}"
+                    )
+                size = self._normalize_size_to_multiple_of_16(
+                    self._image_dimensions(image_uploads[size][0])
+                )
+        except ImageGenerationError as exc:
+            yield event.plain_result(f"图生图失败：{exc}")
+            return
+        self._start_edit_task(event, prompt, api_key, image_uploads, size)
         yield event.plain_result(
-            f"已开始根据 {len(image_uploads)} 张参考图片生成，完成后会自动发送。"
+            "开始生成图片喵~"
+            if used_avatar else f"已开始根据 {len(image_uploads)} 张参考图片生图喵~"
         )
+
+    async def _sender_avatar_upload(self, event: AstrMessageEvent) -> ImageUpload:
+        """仅使用发送指令者的 QQ 头像，不使用群头像或被引用者头像。"""
+        if event.get_platform_name() != "aiocqhttp":
+            raise ImageGenerationError("请包含或引用图片喵")
+        sender_id = str(event.get_sender_id()).strip()
+        if not re.fullmatch(r"[1-9][0-9]*", sender_id):
+            raise ImageGenerationError("无法获取发送者 QQ 号，请附带或引用图片")
+        avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={sender_id}&s=640"
+        return await asyncio.to_thread(self._download_avatar_upload, avatar_url)
+
+    def _download_avatar_upload(self, avatar_url: str) -> ImageUpload:
+        """在线程中下载头像，复用下载大小限制和参考图片格式检查。"""
+        try:
+            with requests.Session() as session:
+                image_bytes = self._download_image(session, avatar_url)
+            extension, content_type = self._image_file_type(image_bytes)
+            self._image_dimensions(image_bytes)
+        except ImageGenerationError as exc:
+            raise ImageGenerationError(
+                f"QQ 头像获取失败喵，请稍后重试或附带图片：{exc}"
+            ) from exc
+        return image_bytes, f"avatar.{extension}", content_type
 
     def _start_edit_task(
         self,
@@ -167,10 +249,10 @@ class ImageGeneratePlugin(Star):
         task.add_done_callback(self._generation_tasks.discard)
 
     async def _generate_and_send(
-        self, event: AstrMessageEvent, prompt: str, api_key: str
+        self, event: AstrMessageEvent, prompt: str, api_key: str , size: str 
     ) -> None:
         try:
-            image_bytes = await self._generate_image(prompt, api_key)
+            image_bytes = await self._generate_image(prompt, api_key, size)
             await event.send(event.chain_result([Comp.Image.fromBytes(image_bytes)]))
         except asyncio.CancelledError:
             logger.info("image_generate 后台任务已取消")
@@ -183,7 +265,7 @@ class ImageGeneratePlugin(Star):
             try:
                 await event.send(
                     event.plain_result(
-                        "生图失败：插件发生未预期错误，请查看 AstrBot 日志。"
+                        "生图失败：插件发生未预期错误，请查看日志喵"
                     )
                 )
             except Exception:
@@ -213,61 +295,24 @@ class ImageGeneratePlugin(Star):
             try:
                 await event.send(
                     event.plain_result(
-                        "图生图失败：插件发生未预期错误，请查看 AstrBot 日志。"
+                        "图生图失败：插件发生未预期错误，请查看日志喵"
                     )
                 )
             except Exception:
                 logger.exception("image_generate 无法向用户发送图生图错误消息")
 
-    async def _generate_image(self, prompt: str, api_key: str) -> bytes:
+    async def _generate_image(self, prompt: str, api_key: str, size: str) -> bytes:
         api_url = str(self.config.get("api_url", DEFAULT_API_URL)).strip()
-        if not api_url.startswith(("http://", "https://")):
-            raise ImageGenerationError("插件配置中的中转站地址无效")
-
-        request_timeout = self._request_timeout()
         payload = {
-            "model": MODEL,
+            "model": self._model_name(),
             "prompt": prompt,
-            "size": IMAGE_SIZE,
+            "size": size,
             "n": 1,
         }
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
-
-        timeout = aiohttp.ClientTimeout(total=request_timeout)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    api_url, headers=headers, json=payload
-                ) as response:
-                    response_text = await response.text()
-                    if response.status < 200 or response.status >= 300:
-                        detail = self._short_error(response_text)
-                        raise ImageGenerationError(
-                            f"中转站返回 HTTP {response.status}{detail}"
-                        )
-                    try:
-                        result = await response.json(content_type=None)
-                    except (ValueError, TypeError) as exc:
-                        raise ImageGenerationError("中转站返回的内容不是有效 JSON") from exc
-
-                image = self._first_image(result)
-                if image.get("b64_json"):
-                    return self._decode_base64_image(image["b64_json"])
-
-                image_url = image.get("url")
-                if image_url:
-                    return await self._download_image(session, str(image_url))
-
-                raise ImageGenerationError("中转站响应中没有 b64_json 或图片 URL")
-        except ImageGenerationError:
-            raise
-        except asyncio.TimeoutError as exc:
-            raise ImageGenerationError("请求中转站超时") from exc
-        except aiohttp.ClientError as exc:
-            raise ImageGenerationError(f"无法连接中转站：{exc}") from exc
+        # requests 是同步库：完整的请求和结果下载都在工作线程执行。
+        return await asyncio.to_thread(
+            self._request_image, api_url, api_key, payload, None, self._request_timeout()
+        )
 
     async def _edit_image(
         self,
@@ -276,64 +321,58 @@ class ImageGeneratePlugin(Star):
         image_uploads: list[ImageUpload],
         size: str,
     ) -> bytes:
-        api_url = str(
-            self.config.get("edit_api_url", DEFAULT_EDIT_API_URL)
-        ).strip()
+        api_url = str(self.config.get("edit_api_url", DEFAULT_EDIT_API_URL)).strip()
+        payload = {
+            "model": self._model_name(),
+            "prompt": prompt,
+            "size": size,
+            "n": "1",
+        }
+        # 列表允许多个文件使用同一个 image[] 字段名。
+        files = [
+            ("image[]", (filename, image_bytes, content_type))
+            for image_bytes, filename, content_type in image_uploads
+        ]
+        return await asyncio.to_thread(
+            self._request_image, api_url, api_key, payload, files, self._request_timeout()
+        )
+
+    def _request_image(
+        self, api_url: str, api_key: str, payload: dict, files: list | None,
+        request_timeout: int,
+    ) -> bytes:
+        """同步网络操作，只从工作线程调用。"""
         if not api_url.startswith(("http://", "https://")):
-            raise ImageGenerationError("插件配置中的图生图接口地址无效")
-
-        form = aiohttp.FormData()
-        form.add_field("model", MODEL)
-        form.add_field("prompt", prompt)
-        form.add_field("size", size)
-        form.add_field("n", "1")
-        for image_bytes, filename, content_type in image_uploads:
-            form.add_field(
-                "image",
-                image_bytes,
-                filename=filename,
-                content_type=content_type,
-            )
-
+            raise ImageGenerationError("插件配置中的接口地址无效喵~")
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
-        timeout = aiohttp.ClientTimeout(total=self._request_timeout())
+        # 文生图发送 JSON；图生图由 requests 自动编码 multipart 文件表单。
+        request_body = {"json": payload} if files is None else {"data": payload, "files": files}
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    api_url, headers=headers, data=form
+            with requests.Session() as session:
+                with session.post(
+                    api_url, headers=headers, timeout=(30, request_timeout), **request_body
                 ) as response:
-                    response_text = await response.text()
-                    if response.status < 200 or response.status >= 300:
-                        detail = self._short_error(response_text)
+                    if not 200 <= response.status_code < 300:
+                        detail = self._short_error(response.text)
                         raise ImageGenerationError(
-                            f"中转站返回 HTTP {response.status}{detail}"
+                            f"生图站返回 HTTP {response.status_code}{detail}"
                         )
                     try:
-                        result = await response.json(content_type=None)
-                    except (ValueError, TypeError) as exc:
-                        raise ImageGenerationError(
-                            "中转站返回的内容不是有效 JSON"
-                        ) from exc
-
+                        result = response.json()
+                    except ValueError as exc:
+                        raise ImageGenerationError("生图站返回的内容不是有效 JSON") from exc
                 image = self._first_image(result)
                 if image.get("b64_json"):
                     return self._decode_base64_image(image["b64_json"])
-
-                image_url = image.get("url")
-                if image_url:
-                    return await self._download_image(session, str(image_url))
-
-                raise ImageGenerationError(
-                    "中转站响应中没有 b64_json 或图片 URL"
-                )
-        except ImageGenerationError:
-            raise
-        except asyncio.TimeoutError as exc:
-            raise ImageGenerationError("图生图请求中转站超时") from exc
-        except aiohttp.ClientError as exc:
+                if image.get("url"):
+                    return self._download_image(session, str(image["url"]))
+                raise ImageGenerationError("生图站没有响应 b64_json 或图片 URL")
+        except requests.exceptions.Timeout as exc:
+            raise ImageGenerationError("请求超时") from exc
+        except requests.exceptions.RequestException as exc:
             raise ImageGenerationError(f"无法连接中转站：{exc}") from exc
 
     async def _collect_input_images(
@@ -551,28 +590,33 @@ class ImageGeneratePlugin(Star):
             return width, height
         raise ImageGenerationError("无法从 WebP 参考图片读取尺寸")
 
-    async def _download_image(
-        self, session: aiohttp.ClientSession, image_url: str
+    def _download_image(
+        self, session: requests.Session, image_url: str
     ) -> bytes:
         if not image_url.startswith(("http://", "https://")):
-            raise ImageGenerationError("中转站返回了无效的图片 URL")
-
+            raise ImageGenerationError("返回的图片 URL 无效喵")
         try:
-            async with session.get(
-                image_url, timeout=aiohttp.ClientTimeout(total=60)
-            ) as response:
-                if response.status < 200 or response.status >= 300:
+            # 不把生图请求的 Authorization 请求头传给图片下载地址。
+            with session.get(image_url, timeout=(30, 60), stream=True) as response:
+                if not 200 <= response.status_code < 300:
                     raise ImageGenerationError(
-                        f"下载生成图片失败，HTTP {response.status}"
+                        f"下载图片失败，HTTP {response.status_code}"
                     )
-                image_bytes = await response.read()
-        except asyncio.TimeoutError as exc:
-            raise ImageGenerationError("下载生成图片超时") from exc
-        except aiohttp.ClientError as exc:
-            raise ImageGenerationError(f"下载生成图片失败：{exc}") from exc
-
+                image_bytes = bytearray()
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    image_bytes.extend(chunk)
+                    if len(image_bytes) > MAX_IMAGE_BYTES:
+                        raise ImageGenerationError("返回的图片超过 25 MB 喵")
+        except requests.exceptions.Timeout as exc:
+            raise ImageGenerationError("图片下载超时喵") from exc
+        except requests.exceptions.RequestException as exc:
+            raise ImageGenerationError(f"图片下载失败：{exc}") from exc
         self._validate_image_size(image_bytes)
-        return image_bytes
+        return bytes(image_bytes)
+
+    def _model_name(self) -> str:
+        value = self.config.get("model", DEFAULT_MODEL)
+        return str(value or DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
     def _request_timeout(self) -> int:
         try:
